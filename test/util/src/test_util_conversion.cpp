@@ -4,9 +4,6 @@
 #include "ble_hci.h"
 #include "sd_rpc_types.h"
 
-#include <fmt/core.h>
-#include <spdlog/logger.h>
-
 #include <cctype>
 #include <iomanip>
 #include <map>
@@ -26,7 +23,14 @@ namespace testutil {
  */
 std::string asHex(const std::vector<uint8_t> &data)
 {
-    return fmt::format("{:#x}", fmt::join(data, " "));
+    std::stringstream retval;
+
+    for (uint8_t const &value : data)
+    {
+        retval << std::setfill('0') << std::setw(2) << std::hex << static_cast<int>(value) << ' ';
+    }
+
+    return retval.str();
 }
 
 std::string asHex(const uint16_t &data)
@@ -716,18 +720,10 @@ std::string asText(const ble_data_t &data)
     std::stringstream retval;
 
     std::vector<uint8_t> wrappedData;
+    wrappedData.assign(data.p_data, data.p_data + data.len);
 
-    if (data.p_data != nullptr)
-    {
-        wrappedData.assign(data.p_data, data.p_data + data.len);
-        retval << "data:" << asHex(wrappedData);
-        retval << " len:" << static_cast<uint32_t>(data.len);
-    }
-    else
-    {
-        retval << "data:null";
-        retval << " len:" << static_cast<uint32_t>(data.len);
-    }
+    retval << "data:" << asHex(wrappedData);
+    retval << " len:" << static_cast<uint32_t>(data.len);
 
     return retval.str();
 }
@@ -760,17 +756,11 @@ std::string asText(const ble_gap_evt_adv_report_t &advReport)
     std::stringstream retval;
 
     retval << "peer_addr:[" << asText(advReport.peer_addr) << "]";
-    std::vector<uint8_t> data;
-
 #if NRF_SD_BLE_API == 6
-    if (advReport.data.p_data != nullptr)
-    {
-        data =
-            std::vector<uint8_t>(advReport.data.p_data, advReport.data.p_data + advReport.data.len);
-        retval << " type:[" << asText(advReport.type) << "]";
-    }
+    std::vector<uint8_t> data(advReport.data.p_data, advReport.data.p_data + advReport.data.len);
+    retval << " type:[" << asText(advReport.type) << "]";
 #else
-    data = std::vector<uint8_t>(advReport.data, advReport.data + advReport.dlen);
+    std::vector<uint8_t> data(advReport.data, advReport.data + advReport.dlen);
     retval << " type:" << asHex(advReport.type);
 #endif
 
@@ -1097,38 +1087,6 @@ sd_rpc_log_severity_t parseLogSeverity(const std::string &level)
 
     std::stringstream ss;
     ss << "Not able to parse '" << level << "' to be sd_rpc_log_severity_t.";
-    throw std::invalid_argument(ss.str());
-}
-
-spdlog::level::level_enum parseSpdLogLevel(const std::string &level)
-{
-    if (level == "trace")
-    {
-        return spdlog::level::level_enum::trace;
-    }
-    else if (level == "debug")
-    {
-        return spdlog::level::level_enum::debug;
-    }
-    else if (level == "info")
-    {
-        return spdlog::level::level_enum::info;
-    }
-    else if (level == "warning")
-    {
-        return spdlog::level::level_enum::warn;
-    }
-    else if (level == "error")
-    {
-        return spdlog::level::level_enum::err;
-    }
-    else if (level == "fatal")
-    {
-        return spdlog::level::level_enum::critical;
-    }
-
-    std::stringstream ss;
-    ss << "Not able to parse '" << level << "' to be spdlog::level::level_enum.";
     throw std::invalid_argument(ss.str());
 }
 } // namespace testutil

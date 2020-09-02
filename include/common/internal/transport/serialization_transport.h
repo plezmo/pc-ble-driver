@@ -38,7 +38,6 @@
 #ifndef SERIALIZATION_TRANSPORT_H
 #define SERIALIZATION_TRANSPORT_H
 
-#include "h5_transport.h"
 #include "transport.h"
 
 #include "ble.h"
@@ -54,7 +53,7 @@
 typedef uint32_t (*transport_rsp_handler_t)(const uint8_t *p_buffer, uint16_t length);
 typedef std::function<void(ble_evt_t *p_ble_evt)> evt_cb_t;
 
-constexpr size_t MaxPossibleEventLength = 700;
+constexpr uint32_t MaxPossibleEventLength = 700;
 
 struct eventData_t
 {
@@ -79,19 +78,19 @@ class SerializationTransport
     SerializationTransport(SerializationTransport &&)                 = delete;
     SerializationTransport &operator=(SerializationTransport &&) = delete;
 
-    SerializationTransport(H5Transport *dataLinkLayer, uint32_t response_timeout);
-    ~SerializationTransport();
+    SerializationTransport(Transport *dataLinkLayer, uint32_t response_timeout);
+    ~SerializationTransport() = default;
 
     uint32_t open(const status_cb_t &status_callback, const evt_cb_t &event_callback,
-                  const log_cb_t &log_callback) noexcept;
-    uint32_t close() noexcept;
+                  const log_cb_t &log_callback);
+    uint32_t close();
     uint32_t send(const std::vector<uint8_t> &cmdBuffer,
                   std::shared_ptr<std::vector<uint8_t>> rspBuffer,
-                  serialization_pkt_type_t pktType = SERIALIZATION_COMMAND) noexcept;
+                  serialization_pkt_type_t pktType = SERIALIZATION_COMMAND);
 
   private:
     void readHandler(const uint8_t *data, const size_t length);
-    void eventHandlingRunner() noexcept;
+    void eventHandlingRunner();
 
     status_cb_t statusCallback;
     evt_cb_t eventCallback;
@@ -99,7 +98,7 @@ class SerializationTransport
 
     data_cb_t dataCallback;
 
-    std::shared_ptr<H5Transport> nextTransportLayer;
+    std::shared_ptr<Transport> nextTransportLayer;
     uint32_t responseTimeout;
 
     bool responseReceived;
@@ -114,14 +113,9 @@ class SerializationTransport
     std::condition_variable eventWaitCondition;
     std::thread eventThread;
     std::queue<std::vector<uint8_t>> eventQueue;
-    void drainEventQueue();
-    bool processEvents;
 
-    // Use recursive mutex since the mutex may be acquired recursively in the same thread
-    // in the case of ::eventHandlingRunner thread calling a application callback that
-    // again invoke a function that call ::send
-    std::recursive_mutex isOpenMutex;
-    bool isOpen;
+    std::atomic<bool> isOpen; // Variable is shared between threads
+    std::mutex publicMethodMutex;
 };
 
 #endif // SERIALIZATION_TRANSPORT_H

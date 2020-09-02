@@ -1,26 +1,69 @@
+function(nrf_configure_sdk_affected_files SDK_VERSION SDK_DIRECTORY SER_CONFIG_PATH MAIN_PATH)
+    if(SDK_VERSION EQUAL 11)
+        set(MAIN_PATH "${SDK_DIRECTORY}/examples/ble_central_and_peripheral/ble_connectivity/main.c" PARENT_SCOPE)
+    elseif(SDK_VERSION EQUAL 15)
+        set(MAIN_PATH "${SDK_DIRECTORY}/examples/connectivity/ble_connectivity/main.c" PARENT_SCOPE)
+    else()
+        message(FATAL_ERROR "Not able to prepare SDK with configuration values because SDK v${SDK_VERSION} is unknown.")
+        return()
+    endif()
+
+    set(SER_CONFIG_PATH "${SDK_DIRECTORY}/components/serialization/common/ser_config.h" PARENT_SCOPE)
+endfunction()
+
 function(nrf_extract_version_number VERSION_NUMBER MAJOR MINOR PATCH)
     string(REGEX MATCH "([0-9]+)\\.([0-9]+)\\.([0-9]+)" MATCHES ${VERSION_NUMBER})
 
     if(VERSION)
-        set(${MAJOR} "${CMAKE_MATCH_1}" PARENT_SCOPE)
-        set(${MINOR} "${CMAKE_MATCH_2}" PARENT_SCOPE)
-        set(${PATCH} "${CMAKE_MATCH_3}" PARENT_SCOPE)
+        set(MAJOR "${CMAKE_MATCH_1}" PARENT_SCOPE)
+        set(MINOR "${CMAKE_MATCH_2}" PARENT_SCOPE)
+        set(PATCH "${CMAKE_MATCH_3}" PARENT_SCOPE)
     else()
         message(FATAL_ERROR "Not able to parse version:${VERSION}")
     endif()
 endfunction()
 
 function(nrf_configure_sdk_values SDK_VERSION SDK_DIRECTORY)
+    set(SER_CONFIG_PATH)
+    set(MAIN_PATH)
+
+    nrf_configure_sdk_affected_files(${SDK_VERSION} ${SDK_DIRECTORY} SER_CONFIG_PATH MAIN_PATH)
+
+    if(NOT EXISTS ${SER_CONFIG_PATH})
+        message(FATAL_ERROR "Not able to find ser_config.h in path ${SER_CONFIG_PATH}")
+    endif()
+
+    if(NOT EXISTS ${MAIN_PATH})
+        message(FATAL_ERROR "Not able to find main.c in path ${SER_CONFIG_PATH}")
+    endif()
+
+    file(READ ${SER_CONFIG_PATH} SER_CONFIG)
+    file(READ ${MAIN_PATH} MAIN)
+
+    if(SDK_VERSION STREQUAL 11)
+        string(REGEX REPLACE "#define (SER_PHY_UART_BAUDRATE)(.+)UART_BAUDRATE_BAUDRATE_Baud1M\n" "#cmakedefine \\1\\2@SER_PHY_UART_BAUDRATE@\n" SER_CONFIG_IN ${SER_CONFIG})
+    elseif(SDK_VERSION STREQUAL 15)
+        string(REGEX REPLACE "#define (SER_PHY_UART_BAUDRATE_VAL)(.+)1000000\n" "#cmakedefine \\1\\2@SER_PHY_UART_BAUDRATE_VAL@\n" SER_CONFIG_IN ${SER_CONFIG})
+    endif()
+
+    file(WRITE "${SER_CONFIG_PATH}.in" "${SER_CONFIG_IN}")
+
+    # Version number is defined the same way in supported SDKS
+    string(REGEX REPLACE "(\\.version_major[ ]+\\=[ ]+)0xf1(,\n)" "\\1@VERSION_MAJOR@\\2" MAIN_IN "${MAIN}")
+    string(REGEX REPLACE "(\\.version_minor[ ]+\\=[ ]+)0xf2(,\n)" "\\1@VERSION_MINOR@\\2" MAIN_IN "${MAIN_IN}")
+    string(REGEX REPLACE "(\\.version_patch[ ]+\\=[ ]+)0xf3(,\n)" "\\1@VERSION_PATCH@\\2" MAIN_IN "${MAIN_IN}")
+    file(WRITE "${MAIN_PATH}.in" "${MAIN_IN}")
+
      # Configure armgcc related files (if armgcc is available)
     find_program(GCC "arm-none-eabi-gcc")
 
-    if(DEFINED ENV{GNUARMEMB_TOOLCHAIN_PATH} OR GCC)
+    if(DEFINED ENV{GCCARMEMB_TOOLCHAIN_PATH} OR GCC)
         # Get gcc version
         if(GCC)
             get_filename_component(GCC_TOOLCHAIN_PATH "${GCC}" DIRECTORY)
             set(GCC_TOOLCHAIN_PATH "${GCC_TOOLCHAIN_PATH}/..")
         else()
-            set(GCC_TOOLCHAIN_PATH "$ENV{GNUARMEMB_TOOLCHAIN_PATH}")
+            set(GCC_TOOLCHAIN_PATH "$ENV{GCCARMEMB_TOOLCHAIN_PATH}")
             # Environment variables are quoted, remove the quote
             string(REPLACE "\"" "" GCC_TOOLCHAIN_PATH "${GCC_TOOLCHAIN_PATH}")
         endif()
@@ -36,7 +79,7 @@ function(nrf_configure_sdk_values SDK_VERSION SDK_DIRECTORY)
             OUTPUT_VARIABLE GCC_VERSION
         )
 
-        # SDKv15 requires bin in addition to GNUARMEMB_TOOLCHAIN_PATH set by gccvar
+        # SDKv15 requires bin in addition to GCCARMEMB_TOOLCHAIN_PATH set by gccvar
         if(SDK_VERSION EQUAL 15)
             set(GCC_TOOLCHAIN_PATH "${GCC_TOOLCHAIN_PATH}/bin/")
         endif()
@@ -49,10 +92,10 @@ function(nrf_configure_sdk_values SDK_VERSION SDK_DIRECTORY)
             return()
         endif()
 
-        set(ARM_GCC_TOOLCHAIN_VERSION "7.3.1")
+        set(ARM_GCC_TOOLCHAIN_VERSION_MIN "7.3.1")
 
-        if(NOT GCC_VERSION VERSION_EQUAL "${ARM_GCC_TOOLCHAIN_VERSION}")
-            message(FATAL_ERROR "Required armgcc toolchain version not provided. Needs to be ${ARM_GCC_TOOLCHAIN_VERSION}.")
+        if(GCC_VERSION VERSION_LESS "${ARM_GCC_TOOLCHAIN_VERSION_MIN}")
+            message(FATAL_ERROR "armgcc toolchain version is too old. Needs to be ${ARM_GCC_TOOLCHAIN_VERSION_MIN} or newer.")
         endif()
 
         set(TOOLCHAIN_PATH "${SDK_DIRECTORY}/components/toolchain/gcc")
@@ -75,7 +118,7 @@ function(nrf_configure_sdk_values SDK_VERSION SDK_DIRECTORY)
                     file(WRITE "${MAKEFILE_COMMON}.pristine" "${MAKEFILE_CONTENT}")
 
                     string(
-                        REPLACE "RM := rm -rf" "RM := \"${CMAKE_COMMAND}\" -E remove_directory"
+                        REPLACE "RM := rm -rf" "RM := \"${CMAKE_COMMAND}\" -E remove_directory" 
                         MAKEFILE_CONTENT_NEW "${MAKEFILE_CONTENT}"
                     )
 
@@ -132,28 +175,21 @@ endfunction()
     The function sets the parent scope variable SDK to location of the prepared SDK
 ]]
 function(nrf_prepare_sdk)
-    set(oneValueArgs SHA512 FILENAME SDK_VERSION SDK_PATH)
+    set(oneValueArgs SHA512 FILENAME SDK_VERSION)
     set(multipleValuesArgs URLS PATCH_FILES)
     cmake_parse_arguments(nrf_prepare_sdk "" "${oneValueArgs}" "${multipleValuesArgs}" ${ARGN})
-
-    if(NOT DEFINED nrf_prepare_sdk_SHA512)
-        message(FATAL_ERROR "nrf_prepare_sdk requires a SHA512 argument.")
-    endif()
-
-    if(NOT DEFINED nrf_prepare_sdk_FILENAME)
-        message(FATAL_ERROR "nrf_prepare_sdk requires a FILENAME argument.")
-    endif()
 
     if(NOT DEFINED nrf_prepare_sdk_SDK_VERSION)
         message(FATAL_ERROR "nrf_prepare_sdk requires a SDK_VERSION argument.")
     endif()
-
-    if(NOT DEFINED nrf_prepare_sdk_SDK_PATH)
-        message(FATAL_ERROR "nrf_prepare_sdk requires a SDK_PATH argument.")
-    endif()
-
     if(NOT DEFINED nrf_prepare_sdk_URLS)
         message(FATAL_ERROR "nrf_prepare_sdk requires a URLS argument.")
+    endif()
+    if(NOT DEFINED nrf_prepare_sdk_FILENAME)
+        message(FATAL_ERROR "nrf_prepare_sdk requires a FILENAME argument.")
+    endif()
+    if(NOT DEFINED nrf_prepare_sdk_SHA512)
+        message(FATAL_ERROR "nrf_prepare_sdk requires a SHA512 argument.")
     endif()
 
     #message(STATUS "URLS: ${nrf_prepare_sdk_URLS}")
@@ -168,6 +204,8 @@ function(nrf_prepare_sdk)
     file(TO_CMAKE_PATH "${SDKS_DIRECTORY}" SDKS_DIRECTORY)
     set(SDK_DIRECTORY "${SDKS_DIRECTORY}/v${nrf_prepare_sdk_SDK_VERSION}")
     set(SDK_VERSION "${nrf_prepare_sdk_SDK_VERSION}")
+
+    SET(SDK_VERSION "${nrf_prepare_sdk_SDK_VERSION}")
 
     set(SDK_SETUP_SUCCESS_FILE "${SDK_DIRECTORY}/.sdk-setup-success")
 
@@ -209,7 +247,7 @@ function(nrf_prepare_sdk)
     endif()
 
     nrf_get_sdk_dir_root(${SDK_DIRECTORY})
-    set(${nrf_prepare_sdk_SDK_PATH} "${SDK_DIRECTORY}" PARENT_SCOPE)
+    set(SDK_PATH "${SDK_DIRECTORY}" PARENT_SCOPE)
 endfunction()
 
 function(nrf_get_sdk_dir_root SDK_DIRECTORY)
@@ -255,9 +293,7 @@ function(nrf_extract_softdevice_info SOFTDEVICE_FILENAME SD_VERSION SOC_FAMILY S
             endif()
         elseif(_SD_VERSION STREQUAL "s132")
             if(_SOC_FAMILY EQUAL 52)
-                if(_SD_API_VERSION STREQUAL "2.0.0")
-                    set(_SD_ID "0x0081")
-                elseif(_SD_API_VERSION STREQUAL "2.0.1")
+                if(_SD_API_VERSION STREQUAL "2.0.1")
                     set(_SD_ID "0x0088")
                 elseif(_SD_API_VERSION STREQUAL "3.0.0")
                     set(_SD_ID "0x008C")
@@ -281,10 +317,6 @@ function(nrf_extract_softdevice_info SOFTDEVICE_FILENAME SD_VERSION SOC_FAMILY S
                     set(_SD_ID "0x00A8")
                 elseif(_SD_API_VERSION STREQUAL "6.1.0")
                     set(_SD_ID "0x00AF")
-                elseif(_SD_API_VERSION STREQUAL "6.1.1")
-                    set(_SD_ID "0x00B7")
-                else()
-                    message(FATAL_ERROR "No firmware ID found for SoftDevice ${_SD_VERSION} v${_SD_API_VERSION}")
                 endif()
             endif()
         elseif(_SD_VERSION STREQUAL "s140")
@@ -293,10 +325,6 @@ function(nrf_extract_softdevice_info SOFTDEVICE_FILENAME SD_VERSION SOC_FAMILY S
                     set(_SD_ID "0x00A9")
                 elseif(_SD_API_VERSION STREQUAL "6.1.0")
                     set(_SD_ID "0x00AE")
-                elseif(_SD_API_VERSION STREQUAL "6.1.1")
-                    set(_SD_ID "0x00B6")
-                else()
-                    message(FATAL_ERROR "No firmware ID found for SoftDevice ${_SD_VERSION} v${_SD_API_VERSION}")
                 endif()
             endif()
         endif()
@@ -345,12 +373,11 @@ function(nrf_find_alternative_softdevice SOFTDEVICE_HEX_PATH ALTERNATIVE_SOFTDEV
     nrf_extract_softdevice_info(${FOUND_SOFTDEVICE_HEX} SD_VERSION SOC_FAMILY SD_API_VERSION SD_ID)
     #message(STATUS "SD_VERSION:${SD_VERSION} SOC_FAMILY:${SD_VERSION} SD_API_VERSION:${SD_API_VERSION} SD_ID:${SD_ID}")
 
-    set(SD_API_VERSION_MAJOR)
-    set(SD_API_VERSION_MINOR)
-    set(SD_API_VERSION_PATCH)
-    nrf_extract_version_number("${SD_API_VERSION}" SD_API_VERSION_MAJOR SD_API_VERSION_MINOR SD_API_VERSION_PATCH)
-
-    set(SOFTDEVICE_SEARCH_PATH "${CMAKE_CURRENT_SOURCE_DIR}/hex/sd_api_v${SD_API_VERSION_MAJOR}/${SD_VERSION}_nrf${SOC_FAMILY}_${SD_API_VERSION_MAJOR}.*_softdevice.hex")
+    set(MAJOR)
+    set(MINOR)
+    set(PATCH)
+    nrf_extract_version_number("${SD_API_VERSION}" MAJOR MAJOR MINOR PATCH)
+    set(SOFTDEVICE_SEARCH_PATH "${CMAKE_CURRENT_SOURCE_DIR}/sd_api_v${MAJOR}/${SD_VERSION}_nrf${SOC_FAMILY}_${MAJOR}.*_softdevice.hex")
     file(GLOB ALTERNATIVE_SOFTDEVICE_HEX LIST_DIRECTORIES false "${SOFTDEVICE_SEARCH_PATH}")
 
     if(ALTERNATIVE_SOFTDEVICE_HEX)
@@ -361,7 +388,7 @@ function(nrf_find_alternative_softdevice SOFTDEVICE_HEX_PATH ALTERNATIVE_SOFTDEV
 
         set(ALTERNATIVE_SD_VERSION)
         set(ALTERNATIVE_SOC_FAMILY)
-        set(ALTERNATIVE_SD_API_VERSION)
+        set(ALTERNATIVE_SOC_SD_API_VERSION)
         set(ALTERNATIVE_SD_ID)
 
         nrf_extract_softdevice_info(${ALTERNATIVE_SOFTDEVICE_HEX} ALTERNATIVE_SD_VERSION ALTERNATIVE_SOC_FAMILY ALTERNATIVE_SD_API_VERSION ALTERNATIVE_SD_ID)
@@ -373,6 +400,6 @@ function(nrf_find_alternative_softdevice SOFTDEVICE_HEX_PATH ALTERNATIVE_SOFTDEV
             message(STATUS "SoftDevice version found is the same version(${ALTERNATIVE_SOFTDEVICE_HEX}) as the one in the SDK(${SD_API_VERSION}). Using the one found in the SDK.")
         endif()
     else()
-        message(STATUS "No newer SoftDevice found.")
+        #message(STATUS "No newer SoftDevice found.")
     endif()
 endfunction()

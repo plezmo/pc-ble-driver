@@ -39,10 +39,10 @@
 #include "catch2/catch.hpp"
 
 // Logging support
-#include "logging.h"
+#include <internal/log.h>
 
 // Test support
-#include <test_environment.h>
+#include <test_setup.h>
 #include <test_util.h>
 
 #include <ble.h>
@@ -65,14 +65,14 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
     const auto peripheral = env.serialPorts.at(1);
 
 #if NRF_SD_BLE_API == 6
+    // Indicates if an error has occurred in a callback.
+    // The test framework is not thread safe so this variable is used to communicate that an issues
+    // has occurred in a callback.
+    auto error       = false;
+    auto testSuccess = false;
+
     SECTION("extended")
     {
-        // Indicates if an error has occurred in a callback.
-        // The test framework is not thread safe so this variable is used to communicate that an
-        // issues has occurred in a callback.
-        auto error       = false;
-        auto testSuccess = false;
-
         const auto maxLengthOfAdvData        = testutil::ADV_DATA_BUFFER_SIZE;
         const auto maxNumberOfAdvertisements = 10; // Random number of advertisements
         const auto advertisementNameLength   = 40; // Random advertisement name length
@@ -88,11 +88,8 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
         std::vector<uint8_t> advertisingData;
         std::vector<uint8_t> scanResponseData;
 
-        // Keep historical advertising data for comparison when advertising terminates
-        std::vector<std::vector<uint8_t>> historicAdvData;
-
-        // Append max number of bytes in advertisement packet with manufacturer specific random
-        // data after the peripheral name
+        // Append max number of bytes in advertisement packet with manufacturer specific random data
+        // after the peripheral name
         const auto remainingSpace = maxLengthOfAdvData -
                                     (advertisementNameLength + 2) /* AD header size */ -
                                     2 /* AD header size manufacturer specific data */;
@@ -102,12 +99,12 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
 
         // Instantiate an adapter to use as BLE Central in the test
         auto c = std::make_shared<testutil::AdapterWrapper>(
-            testutil::Role::Central, central.port, env.baudRate, env.mtu,
-            env.retransmissionInterval, env.responseTimeout);
+            testutil::Central, central.port, env.baudRate, env.mtu, env.retransmissionInterval,
+            env.responseTimeout);
 
         // Instantiated an adapter to use as BLE Peripheral in the test
         auto p = std::make_shared<testutil::AdapterWrapper>(
-            testutil::Role::Peripheral, peripheral.port, env.baudRate, env.mtu,
+            testutil::Peripheral, peripheral.port, env.baudRate, env.mtu,
             env.retransmissionInterval, env.responseTimeout);
 
         REQUIRE(sd_rpc_log_handler_severity_filter_set(c->unwrap(), env.driverLogLevel) ==
@@ -118,7 +115,8 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
         c->setGapEventCallback([&](const uint16_t eventId, const ble_gap_evt_t *gapEvent) -> bool {
             switch (eventId)
             {
-                case BLE_GAP_EVT_ADV_REPORT: {
+                case BLE_GAP_EVT_ADV_REPORT:
+                {
                     const auto advReport = gapEvent->params.adv_report;
 
                     if (testutil::findAdvName(advReport, peripheralAdvName))
@@ -131,9 +129,8 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
                             // Check that the received data is according to setupAdvertisement
                             if (manufacturerSpecificData != randomData)
                             {
-                                get_logger()->error("{} Data configured in peripheral does not "
-                                                    "match data received on central",
-                                                    c->role());
+                                NRF_LOG(c->role() << " Data configured in peripheral does not "
+                                                     "match data received on central");
                                 error = true;
                                 return true;
                             }
@@ -147,36 +144,28 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
                                       advReport.type.connectable == 0 &&
                                       advReport.set_id == advertisementSetId))
                                 {
-                                    get_logger()->error(
-                                        "{} Configured advertisement on peripheral does not "
-                                        "match event received on central",
-                                        c->role());
+                                    NRF_LOG(c->role()
+                                            << " Configured advertisement on peripheral does not "
+                                               "match event received on central");
                                     error = true;
                                     return true;
                                 }
 
                                 // Change advertising data in peripheral
-                                historicAdvData.push_back(scanResponseData);
-
                                 scanResponseData.clear();
                                 testutil::createRandomAdvertisingData(
                                     scanResponseData, peripheralAdvName, randomData);
-
-                                get_logger()->debug("{} Changing advertisement data in "
-                                                    "BLE_GAP_EVT_ADV_REPORT, {} -> {}",
-                                                    c->role(),
-                                                    testutil::asHex(historicAdvData.back()),
-                                                    testutil::asHex(scanResponseData));
+                                NRF_LOG(c->role() << " Changing advertisement data in BLE_GAP_EVT_ADV_REPORT");
 
                                 const auto err_code = p->changeAdvertisingData(
                                     std::vector<uint8_t>(), scanResponseData);
 
                                 if (err_code != NRF_SUCCESS)
                                 {
-                                    get_logger()->error(
-                                        "{} {} error changing advertising data: {}", c->role(),
-                                        testutil::asText(gapEvent->params.adv_report.peer_addr),
-                                        testutil::errorToString(err_code));
+                                    NRF_LOG(c->role() << " Error changing advertising data "
+                                                      << testutil::asText(
+                                                             gapEvent->params.adv_report.peer_addr)
+                                                      << ", " << testutil::errorToString(err_code));
                                     error = true;
                                     return true;
                                 }
@@ -197,8 +186,8 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
 
                         if (err_code != NRF_SUCCESS)
                         {
-                            get_logger()->error("{} Scan start error, err_code {:x}", c->role(),
-                                                err_code);
+                            NRF_LOG(c->role()
+                                    << " Scan start error, err_code " << std::hex << err_code);
                             error = true;
                         }
                     }
@@ -213,14 +202,14 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
             {
                 case BLE_GAP_EVT_TIMEOUT:
                     return false;
-                case BLE_GAP_EVT_SCAN_REQ_REPORT: {
+                case BLE_GAP_EVT_SCAN_REQ_REPORT:
+                {
                     const auto scanRequestReport = gapEvent->params.scan_req_report;
                     if (scanRequestReport.adv_handle != p->scratchpad.adv_handle)
                     {
-                        get_logger()->error("{} BLE_GAP_EVT_SCAN_REQ_REPORT:  Received "
-                                            "advertisement handle does not match the "
-                                            "one setup with sd_ble_gap_adv_set_configure.",
-                                            p->role());
+                        NRF_LOG(p->role() << " BLE_GAP_EVT_SCAN_REQ_REPORT:  Received "
+                                             "advertisement handle does not match the "
+                                             "one setup with sd_ble_gap_adv_set_configure.");
                         error = true;
                         return true;
                     }
@@ -235,61 +224,46 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
                             scanRequestCountOtherCentral += 1;
                         }
 
-                        get_logger()->debug("{} SCAN_REQ_REPORT count, this: {}, other: {}",
-                                            p->role(), scanRequestCountThisCentral,
-                                            scanRequestCountOtherCentral);
+                        NRF_LOG(p->role()
+                                << " SCAN_REQ_REPORT count, this: " << scanRequestCountThisCentral
+                                << ", other: " << scanRequestCountOtherCentral);
                     }
                 }
                     return true;
-                case BLE_GAP_EVT_ADV_SET_TERMINATED: {
+                case BLE_GAP_EVT_ADV_SET_TERMINATED:
+                {
                     const auto setTerminated = gapEvent->params.adv_set_terminated;
 
                     if (setTerminated.adv_handle != p->scratchpad.adv_handle)
                     {
-                        get_logger()->error("{} BLE_GAP_EVT_ADV_SET_TERMINATED: Received "
-                                            "advertisement handle does not match the "
-                                            "one setup with sd_ble_gap_adv_set_configure.",
-                                            p->role());
+                        NRF_LOG(p->role() << " BLE_GAP_EVT_ADV_SET_TERMINATED: Received "
+                                             "advertisement handle does not match the "
+                                             "one setup with sd_ble_gap_adv_set_configure.");
                         error = true;
                         return true;
                     }
 
                     if (setTerminated.reason != BLE_GAP_EVT_ADV_SET_TERMINATED_REASON_LIMIT_REACHED)
                     {
-                        get_logger()->error("{} BLE_GAP_EVT_ADV_SET_TERMINATED: Limit reason "
-                                            "was not LIMIT_REACHED which it should be.",
-                                            p->role());
+                        NRF_LOG(p->role()
+                                << " BLE_GAP_EVT_ADV_SET_TERMINATED: Limit reason was not "
+                                   "LIMIT_REACHED which it should be.");
                         error = true;
                         return true;
                     }
 
                     if (setTerminated.num_completed_adv_events != maxNumberOfAdvertisements)
                     {
-                        get_logger()->error(
-                            "{} BLE_GAP_EVT_ADV_SET_TERMINATED: Number of completed "
-                            "advertisement events does not match max_adv_evts set in "
-                            "sd_ble_gap_adv_set_configure.",
-                            p->role());
+                        NRF_LOG(p->role()
+                                << " BLE_GAP_EVT_ADV_SET_TERMINATED: Number of completed "
+                                   "advertisement events does not match max_adv_evts set in "
+                                   "sd_ble_gap_adv_set_configure.");
                         error = true;
                         return true;
                     }
 
                     std::vector<uint8_t> manufacturerSpecificData;
                     const auto advReport = setTerminated.adv_data;
-
-                    if (advReport.scan_rsp_data.p_data == nullptr)
-                    {
-                        get_logger()->warn(
-                            "{} BLE_GAP_EVT_ADV_SET_TERMINATED: WARNING: scan_rsp_data.p_data "
-                            "is "
-                            "nullptr even though it should point to the set advertisement "
-                            "data. This is a known issue with connectivity and "
-                            "SoftDevice API v6 that we are looking into. We let the test "
-                            "for this pass for now.",
-                            p->role());
-                        testSuccess = true;
-                        return true;
-                    }
 
                     std::vector<uint8_t> scan_rsp_data;
                     const auto data       = advReport.scan_rsp_data.p_data;
@@ -298,29 +272,15 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
 
                     if (scanResponseData != scan_rsp_data)
                     {
-                        // Check if the scan response data received is from a previous advertisement
-                        // setup on peripheral
-                        auto result = std::find(std::begin(historicAdvData),
-                                                std::end(historicAdvData), scan_rsp_data);
-                        if (result != std::end(historicAdvData))
-                        {
-                            get_logger()->info("Found received advertisement in previous "
-                                               "advertisement data sent from peripheral.");
-                        }
-                        else
-                        {
-                            get_logger()->error("{} BLE_GAP_EVT_ADV_SET_TERMINATED: Advertisement "
-                                                "buffers set in sd_ble_gap_adv_set_configure does "
-                                                "not match with advertisement received. "
-                                                "Configured: {} Received: {}",
-                                                p->role(), testutil::asHex(scanResponseData),
-                                                testutil::asHex(scan_rsp_data));
-                            error = true;
-                            return true;
-                        }
+                        NRF_LOG(p->role() << " BLE_GAP_EVT_ADV_SET_TERMINATED: Advertisement "
+                                             "buffers set in sd_ble_gap_adv_set_configure does "
+                                             "not match with advertisement received.");
+                        error = true;
+                        return true;
                     }
 
                     testSuccess = true;
+
                     return true;
                 }
                 default:
@@ -332,8 +292,6 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
             if (code == PKT_DECODE_ERROR || code == PKT_SEND_MAX_RETRIES_REACHED ||
                 code == PKT_UNEXPECTED)
             {
-                get_logger()->error("{} status callback gave error {:x}:{}", c->role(),
-                                    static_cast<uint32_t>(code), message);
                 error = true;
             }
         });
@@ -342,8 +300,6 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
             if (code == PKT_DECODE_ERROR || code == PKT_SEND_MAX_RETRIES_REACHED ||
                 code == PKT_UNEXPECTED)
             {
-                get_logger()->error("{} status callback gave error {:x}:{}", p->role(),
-                                    static_cast<uint32_t>(code), message);
                 error = true;
             }
         });
@@ -375,11 +331,10 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
         // Wait for the test to complete
         std::this_thread::sleep_for(std::chrono::seconds(3));
 
-        // Advertising shall already be stopped, check that actually is
-        REQUIRE(sd_ble_gap_adv_stop(p->unwrap(), p->scratchpad.adv_handle) ==
-                NRF_ERROR_INVALID_STATE);
-
         REQUIRE(sd_ble_gap_scan_stop(c->unwrap()) == NRF_SUCCESS);
+
+        // Advertising shall already be stopped, check that actually is
+        REQUIRE(sd_ble_gap_adv_stop(p->unwrap(), p->scratchpad.adv_handle) == NRF_ERROR_INVALID_STATE);
 
         CHECK(error == false);
         CHECK(testSuccess == true);

@@ -61,14 +61,12 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <sstream>
+#include <stdint.h>
 #include <thread>
-#include <uart_transport.h>
 
 const uint8_t PACKET_RETRANSMISSIONS =
     6; // Number of times to send reliable packets before giving in
@@ -76,12 +74,12 @@ const uint8_t PACKET_RETRANSMISSIONS =
 // Other constants
 
 // Duration to wait for state ACTIVE after open is called
-const auto OPEN_WAIT_TIMEOUT = std::chrono::milliseconds(3000);
+const auto OPEN_WAIT_TIMEOUT = std::chrono::milliseconds(2000);
 // Duration to wait before continuing UART communication after reset is sent to target
 const auto RESET_WAIT_DURATION = std::chrono::milliseconds(300);
 
 #pragma region Public methods
-H5Transport::H5Transport(UartTransport *_nextTransportLayer, const uint32_t retransmission_interval)
+H5Transport::H5Transport(Transport *_nextTransportLayer, const uint32_t retransmission_interval)
     : nextTransportLayer(_nextTransportLayer)
     , seqNum(0)
     , ackNum(0)
@@ -93,22 +91,22 @@ H5Transport::H5Transport(UartTransport *_nextTransportLayer, const uint32_t retr
     , currentState(STATE_START)
     , stateMachineReady(false)
     , isOpen(false)
-{}
+{
+}
 
 H5Transport::~H5Transport() noexcept
 {
-    stopStateMachine();
     delete nextTransportLayer;
 }
 
 uint32_t H5Transport::open(const status_cb_t &status_callback, const data_cb_t &data_callback,
-                           const log_cb_t &log_callback) noexcept
+                           const log_cb_t &log_callback)
 {
-    std::lock_guard<std::recursive_mutex> openLck(isOpenMutex);
+    std::lock_guard<std::mutex> lck(publicMethodMutex);
 
     if (isOpen)
     {
-        return NRF_ERROR_SD_RPC_H5_TRANSPORT_ALREADY_OPEN;
+        return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
     }
 
     isOpen = true;
@@ -120,33 +118,30 @@ uint32_t H5Transport::open(const status_cb_t &status_callback, const data_cb_t &
         return errorCode;
     }
 
+    if (!(currentState == STATE_START || currentState == STATE_CLOSED))
+    {
+        std::stringstream ss;
+        ss << "Not able to open, current state is not valid (" << stateToString(currentState) << ")";
+        log(SD_RPC_LOG_FATAL, ss.str());
+        return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
+    }
+
+    // State machine starts in a separate thread.
+    // Wait for the state machine to be ready
+    setupStateMachine();
+    startStateMachine();
+
+    lastPacket.clear();
+
+    statusCallback =
+        std::bind(&H5Transport::statusHandler, this, std::placeholders::_1, std::placeholders::_2);
+    dataCallback =
+        std::bind(&H5Transport::dataHandler, this, std::placeholders::_1, std::placeholders::_2);
+
+    errorCode = nextTransportLayer->open(statusCallback, dataCallback, upperLogCallback);
+
     try
     {
-        std::unique_lock<std::mutex> lck(currentStateMutex);
-
-        if (!(currentState == STATE_START || currentState == STATE_CLOSED))
-        {
-            std::stringstream ss;
-            ss << "Not able to open, current state is not valid (" << stateToString(currentState)
-               << ")";
-            log(SD_RPC_LOG_FATAL, ss.str());
-            return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
-        }
-
-        // State machine starts in a separate thread.
-        // Wait for the state machine to be ready
-        setupStateMachine();
-        startStateMachine();
-
-        lastPacket.clear();
-
-        statusCallback = std::bind(&H5Transport::statusHandler, this, std::placeholders::_1,
-                                   std::placeholders::_2);
-        dataCallback   = std::bind(&H5Transport::dataHandler, this, std::placeholders::_1,
-                                 std::placeholders::_2);
-
-        errorCode = nextTransportLayer->open(statusCallback, dataCallback, upperLogCallback);
-
         std::unique_lock<std::mutex> stateMachineLock(stateMachineMutex);
 
         const auto currentExitCriteria = exitCriterias.at(currentState);
@@ -173,46 +168,43 @@ uint32_t H5Transport::open(const status_cb_t &status_callback, const data_cb_t &
         stateMachineLock.unlock();
         stateMachineChange.notify_all();
     }
-    catch (const std::out_of_range &)
+    catch (std::out_of_range &)
     {
         return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
-    }
-    catch (const std::exception &ex)
-    {
-        log(SD_RPC_LOG_ERROR, "Unexpected exception when opening adapter", ex);
-        return NRF_ERROR_SD_RPC_H5_TRANSPORT_INTERNAL_ERROR;
     }
 
     if (waitForState(STATE_ACTIVE, OPEN_WAIT_TIMEOUT))
     {
         return NRF_SUCCESS;
     }
-
-    switch (state())
+    else
     {
-        case STATE_START:
-        case STATE_RESET:
-        case STATE_UNINITIALIZED:
-        case STATE_INITIALIZED:
-        case STATE_NO_RESPONSE:
-            // There are two situations on can get timeout:
-            // 1) there is no response from the device
-            // 2) non failing state transitions from STATE_START to STATE_ACTIVE did not happen
-            // in time period OPEN_WAIT_TIMEOUT
-            return NRF_ERROR_TIMEOUT;
-        case STATE_FAILED:
-        case STATE_CLOSED:
-            return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
-        case STATE_ACTIVE:
-            return NRF_SUCCESS;
-        default:
-            return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
+        switch (state())
+        {
+            case STATE_START:
+            case STATE_RESET:
+            case STATE_UNINITIALIZED:
+            case STATE_INITIALIZED:
+            case STATE_NO_RESPONSE:
+                // There are two situations on can get timeout:
+                // 1) there is no response from the device
+                // 2) non failing state transitions from STATE_START to STATE_ACTIVE did not happen
+                // in time period OPEN_WAIT_TIMEOUT
+                return NRF_ERROR_TIMEOUT;
+            case STATE_FAILED:
+            case STATE_CLOSED:
+                return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
+            case STATE_ACTIVE:
+                return NRF_SUCCESS;
+            default:
+                return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
+        }
     }
 }
 
-uint32_t H5Transport::close() noexcept
+uint32_t H5Transport::close()
 {
-    std::lock_guard<std::recursive_mutex> openLck(isOpenMutex);
+    std::lock_guard<std::mutex> lck(publicMethodMutex);
 
     if (!isOpen)
     {
@@ -221,124 +213,85 @@ uint32_t H5Transport::close() noexcept
 
     isOpen = false;
 
-    {
-        std::unique_lock<std::mutex> currentStateLck(currentStateMutex);
-
-        try
-        {
-            const auto currentExitCriteria = exitCriterias.at(currentState);
-            const auto exitCriteria        = currentExitCriteria.get();
-
-            if (exitCriteria != nullptr)
-            {
-                std::unique_lock<std::mutex> stateMachineLock(stateMachineMutex);
-                exitCriteria->close = true;
-            }
-
-            stateMachineChange.notify_all();
-        }
-        catch (const std::out_of_range &)
-        {
-            std::stringstream ss;
-            ss << "State " << stateToString(currentState)
-               << " does not have exit criteria associated with it. Will continue to close the "
-                  "H5Transport.";
-            log(SD_RPC_LOG_WARNING, ss.str());
-        }
-        catch (const std::exception &)
-        {
-            return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
-        }
-    }
-
     try
     {
-        stopStateMachine();
+        std::unique_lock<std::mutex> stateMachineLock(stateMachineMutex);
+        const auto currentExitCriteria = exitCriterias.at(currentState);
+        const auto exitCriteria        = currentExitCriteria.get();
+
+        if (exitCriteria != nullptr)
+        {
+            exitCriteria->close = true;
+        }
+
+        // Notify about the change in the state machine
+        stateMachineLock.unlock();
+        stateMachineChange.notify_all();
     }
-    catch (const std::exception &)
+    catch (std::out_of_range &)
     {
-        return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
+        std::stringstream ss;
+        ss << "State " << stateToString(currentState)
+           << " does not have exit criteria associated with it. Will continue to close the "
+              "H5Transport.";
+        log(SD_RPC_LOG_WARNING, ss.str());
     }
+
+    stopStateMachine();
 
     return nextTransportLayer->close();
 }
 
-uint32_t H5Transport::send(const std::vector<uint8_t> &data) noexcept
+uint32_t H5Transport::send(const std::vector<uint8_t> &data)
 {
-    std::lock_guard<std::recursive_mutex> openLck(isOpenMutex);
+    std::lock_guard<std::mutex> lck(publicMethodMutex);
 
-    if (!isOpen)
+    if (currentState != STATE_ACTIVE || !isOpen)
     {
         return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
     }
 
-    if (currentState != STATE_ACTIVE)
+    // max theoretical length of encoded packet, aditional 6 bytes h5 encoding and all bytes escaped
+    // + 2 packet encapsuling
+    payload_t h5EncodedPacket;
+
+    h5_encode(data, h5EncodedPacket, seqNum, ackNum, true, true, VENDOR_SPECIFIC_PACKET);
+
+    payload_t encodedPacket;
+    slip_encode(h5EncodedPacket, encodedPacket);
+
+    auto remainingRetransmissions = PACKET_RETRANSMISSIONS;
+
+    lastPacket.clear();
+    lastPacket = encodedPacket;
+
+    std::unique_lock<std::mutex> ackGuard(ackMutex);
+
+    while (remainingRetransmissions--)
     {
-        return NRF_ERROR_SD_RPC_H5_TRANSPORT_STATE;
-    }
+        logPacket(true, h5EncodedPacket);
+        const auto err_code = nextTransportLayer->send(lastPacket);
 
-    try
-    {
-        // max theoretical length of encoded packet, aditional 6 bytes h5 encoding and all bytes
-        // escaped
-        // + 2 packet encapsuling
+        if (err_code != NRF_SUCCESS)
+            return err_code;
 
-        payload_t h5EncodedPacket;
+        const uint8_t seqNumBefore = seqNum;
 
+        // Checking for timeout. Also checking against spurios wakeup by making sure the sequence
+        // number has actually increased. If the sequence number has not increased, we have not
+        // received an ACK packet, and should not exit the loop (unless timeout).
+        // Ref. spurious wakeup:
+        // http://en.cppreference.com/w/cpp/thread/condition_variable
+        // https://en.wikipedia.org/wiki/Spurious_wakeup
+        if (ackWaitCondition.wait_for(ackGuard, std::chrono::milliseconds(retransmissionInterval),
+                                      [&] { return seqNum != seqNumBefore; }))
         {
-            std::unique_lock<std::recursive_mutex> seqNumLck(seqNumMutex);
-            std::unique_lock<std::recursive_mutex> ackNumLck(ackNumMutex);
-            h5_encode(data, h5EncodedPacket, seqNum, ackNum, true, true, VENDOR_SPECIFIC_PACKET);
+            lastPacket.clear();
+            return NRF_SUCCESS;
         }
-
-        payload_t encodedPacket;
-        slip_encode(h5EncodedPacket, encodedPacket);
-
-        auto remainingRetransmissions = PACKET_RETRANSMISSIONS;
-
-        lastPacket.clear();
-        lastPacket = encodedPacket;
-
-        std::unique_lock<std::mutex> ackLock(ackMutex);
-
-        while (remainingRetransmissions--)
-        {
-            logPacket(true, h5EncodedPacket);
-            const auto err_code = nextTransportLayer->send(lastPacket);
-
-            if (err_code != NRF_SUCCESS)
-                return err_code;
-
-            uint8_t seqNumBefore;
-
-            {
-                std::unique_lock<std::recursive_mutex> seqNumLck(seqNumMutex);
-                seqNumBefore = seqNum;
-            }
-
-            // Checking for timeout. Also checking against spurios wakeup by making sure the
-            // sequence number has actually increased. If the sequence number has not increased, we
-            // have not received an ACK packet, and should not exit the loop (unless timeout). Ref.
-            // spurious wakeup: http://en.cppreference.com/w/cpp/thread/condition_variable
-            // https://en.wikipedia.org/wiki/Spurious_wakeup
-            if (ackReceived.wait_for(
-                    ackLock, std::chrono::milliseconds(retransmissionInterval), [&] {
-                        std::unique_lock<std::recursive_mutex> seqNumLck(seqNumMutex);
-                        return seqNum != seqNumBefore;
-                    }))
-            {
-                lastPacket.clear();
-                return NRF_SUCCESS;
-            }
-        }
-
-        lastPacket.clear();
-    }
-    catch (const std::exception &)
-    {
-        return NRF_ERROR_SD_RPC_H5_TRANSPORT_INTERNAL_ERROR;
     }
 
+    lastPacket.clear();
     return NRF_ERROR_SD_RPC_H5_TRANSPORT_NO_RESPONSE;
 }
 
@@ -352,17 +305,17 @@ h5_state_t H5Transport::state() const
 #pragma region Processing incoming data from UART
 void H5Transport::processPacket(const payload_t &packet)
 {
-    uint8_t decodedSeqNum;
-    uint8_t decodedAckNum;
-    bool decodedReliablePacket;
-    h5_pkt_type_t decodedPacketType;
+    uint8_t seq_num;
+    uint8_t ack_num;
+    bool reliable_packet;
+    h5_pkt_type_t packet_type;
 
     payload_t slipPayload;
     auto err_code = slip_decode(packet, slipPayload);
 
     if (err_code != NRF_SUCCESS)
     {
-        ++errorPacketCount;
+        errorPacketCount++;
 
         std::stringstream ss;
         ss << "slip_decode error, code: 0x" << std::hex << static_cast<uint32_t>(err_code);
@@ -377,12 +330,12 @@ void H5Transport::processPacket(const payload_t &packet)
 
     payload_t h5Payload;
 
-    err_code = h5_decode(slipPayload, h5Payload, &decodedSeqNum, &decodedAckNum, nullptr, nullptr,
-                         nullptr, &decodedReliablePacket, &decodedPacketType);
+    err_code = h5_decode(slipPayload, h5Payload, &seq_num, &ack_num, nullptr, nullptr, nullptr,
+                         &reliable_packet, &packet_type);
 
     if (err_code != NRF_SUCCESS)
     {
-        ++errorPacketCount;
+        errorPacketCount++;
 
         std::stringstream ss;
         ss << "h5_decode error, code: 0x" << std::hex << static_cast<uint32_t>(err_code);
@@ -393,8 +346,6 @@ void H5Transport::processPacket(const payload_t &packet)
         return;
     }
 
-    std::unique_lock<std::mutex> currentStateLock(currentStateMutex);
-
     if (currentState == STATE_RESET)
     {
         // Ignore packets packets received in this state.
@@ -404,7 +355,7 @@ void H5Transport::processPacket(const payload_t &packet)
 
     std::unique_lock<std::mutex> stateMachineLock(stateMachineMutex);
 
-    if (decodedPacketType == LINK_CONTROL_PACKET)
+    if (packet_type == LINK_CONTROL_PACKET)
     {
         if (currentState == STATE_UNINITIALIZED)
         {
@@ -456,39 +407,36 @@ void H5Transport::processPacket(const payload_t &packet)
             }
         }
     }
-    else if (decodedPacketType == VENDOR_SPECIFIC_PACKET)
+    else if (packet_type == VENDOR_SPECIFIC_PACKET)
     {
         if (currentState == STATE_ACTIVE)
         {
-            if (decodedReliablePacket)
+            if (reliable_packet)
             {
-                std::lock_guard<std::recursive_mutex> lck(ackNumMutex);
-
-                if (decodedSeqNum == ackNum)
+                if (seq_num == ackNum)
                 {
                     incrementAckNum();
-                    sendControlPacket(CONTROL_PKT_ACK, ackNum);
+                    sendControlPacket(CONTROL_PKT_ACK);
                     upperDataCallback(h5Payload.data(), h5Payload.size());
                 }
                 else
                 {
-                    sendControlPacket(CONTROL_PKT_ACK, ackNum);
+                    sendControlPacket(CONTROL_PKT_ACK);
                 }
             }
         }
     }
-    else if (decodedPacketType == ACK_PACKET)
+    else if (packet_type == ACK_PACKET)
     {
-        std::lock_guard<std::recursive_mutex> lck(seqNumMutex);
-
-        if (decodedAckNum == ((seqNum + 1) & 0x07))
+        if (ack_num == ((seqNum + 1) & 0x07))
         {
             // Received a packet with valid ack_num, inform threads that wait the command is
             // received on the other end
+            std::lock_guard<std::mutex> ackGuard(ackMutex);
             incrementSeqNum();
-            ackReceived.notify_all();
+            ackWaitCondition.notify_all();
         }
-        else if (decodedAckNum == seqNum)
+        else if (ack_num == seqNum)
         {
             // Discard packet, we assume that we have received a reply from a previous packet
         }
@@ -508,8 +456,8 @@ void H5Transport::processPacket(const payload_t &packet)
             {
                 std::stringstream ss;
                 ss << "h5_transport received ack packet in state " << stateToString(currentState)
-                   << ". ack_num is: " << std::hex << +decodedAckNum << " seq_num is: " << std::hex
-                   << +decodedSeqNum << ". Ignoring the packet.";
+                   << ". ack_num is: " << std::hex << ack_num << " seq_num is: " << std::hex
+                   << seq_num << ". Ignoring the packet.";
                 log(SD_RPC_LOG_WARNING, ss.str());
             }
         }
@@ -519,7 +467,7 @@ void H5Transport::processPacket(const payload_t &packet)
     stateMachineChange.notify_all();
 }
 
-void H5Transport::statusHandler(const sd_rpc_app_status_t code, const std::string &message) noexcept
+void H5Transport::statusHandler(const sd_rpc_app_status_t code, const std::string &message)
 {
     if (code == IO_RESOURCES_UNAVAILABLE)
     {
@@ -539,120 +487,80 @@ void H5Transport::statusHandler(const sd_rpc_app_status_t code, const std::strin
         }
         catch (std::out_of_range &)
         {
-            try
-            {
-                std::stringstream ss;
-                ss << "State " << stateToString(currentState)
-                   << " does not have criteria associated with it.";
-                log(SD_RPC_LOG_WARNING, ss.str());
-            }
-            catch (const std::exception &)
-            {
-                log(SD_RPC_LOG_ERROR, "Error creating string describing error status");
-            }
-        }
-        catch (std::exception &e)
-        {
-            try
-            {
-                std::stringstream ss;
-                ss << "Unexpected exception received in state " << stateToString(currentState)
-                   << ", " << e.what();
-                log(SD_RPC_LOG_ERROR, ss.str());
-            }
-            catch (const std::exception &)
-            {
-                log(SD_RPC_LOG_ERROR,
-                    "Error creating string describing error status for unexpected exception");
-            }
+            std::stringstream ss;
+            ss << "State " << stateToString(currentState)
+               << " does not have criteria associated with it.";
+            log(SD_RPC_LOG_WARNING, ss.str());
         }
     }
 
     status(code, message);
 }
 
-void H5Transport::dataHandler(const uint8_t *data, const size_t length) noexcept
+void H5Transport::dataHandler(const uint8_t *data, const size_t length)
 {
     payload_t packet;
 
-    try
+    // Check if we have any data from before that has not been processed.
+    // If so add the remaining data from previous callback(s) to this packet
+    if (!unprocessedData.empty())
     {
-        // Check if we have any data from before that has not been processed.
-        // If so add the remaining data from previous callback(s) to this packet
-        if (!unprocessedData.empty())
-        {
-            packet.insert(packet.begin(), unprocessedData.begin(), unprocessedData.end());
-        }
+        packet.insert(packet.begin(), unprocessedData.begin(), unprocessedData.end());
+    }
 
-        for (size_t i = 0; i < length; i++)
-        {
-            packet.push_back(data[i]);
+    for (size_t i = 0; i < length; i++)
+    {
+        packet.push_back(data[i]);
 
-            if (data[i] == 0xC0)
+        if (data[i] == 0xC0)
+        {
+            if (c0Found)
             {
-                if (c0Found)
+                // End of packet found
+
+                // If we have two 0xC0 after another we assume it is the beginning of a new packet,
+                // and not the end
+                if (packet.size() == 2)
                 {
-                    // End of packet found
-
-                    // If we have two 0xC0 after another we assume it is the beginning of a new
-                    // packet, and not the end
-                    if (packet.size() == 2)
-                    {
-                        packet.clear();
-                        packet.push_back(0xc0);
-                        continue;
-                    }
-
-                    processPacket(packet);
-
                     packet.clear();
-                    unprocessedData.clear();
-                    c0Found = false;
+                    packet.push_back(0xc0);
+                    continue;
                 }
-                else
-                {
-                    // Start of packet found
-                    c0Found = true;
 
-                    // Clear previous data from packet since data before the start of packet is
-                    // irrelevant.
-                    packet.clear();
-                    packet.push_back(0xC0);
-                }
+                processPacket(packet);
+
+                packet.clear();
+                unprocessedData.clear();
+                c0Found = false;
+            }
+            else
+            {
+                // Start of packet found
+                c0Found = true;
+
+                // Clear previous data from packet since data before the start of packet is
+                // irrelevant.
+                packet.clear();
+                packet.push_back(0xC0);
             }
         }
-
-        if (!packet.empty())
-        {
-            unprocessedData.clear();
-            unprocessedData.insert(unprocessedData.begin(), packet.begin(), packet.end());
-        }
     }
-    catch (const std::exception &e)
+
+    if (!packet.empty())
     {
-        try
-        {
-            std::stringstream ss;
-            ss << "Error processing incoming packet, " << e.what();
-            log(SD_RPC_LOG_ERROR, ss.str());
-        }
-        catch (const std::exception &)
-        {
-            log(SD_RPC_LOG_ERROR, "Error creating error message for incoming packet error");
-        }
+        unprocessedData.clear();
+        unprocessedData.insert(unprocessedData.begin(), packet.begin(), packet.end());
     }
 }
 
 void H5Transport::incrementSeqNum()
 {
-    std::unique_lock<std::recursive_mutex> lck(seqNumMutex);
     seqNum++;
     seqNum = seqNum & 0x07;
 }
 
 void H5Transport::incrementAckNum()
 {
-    std::unique_lock<std::recursive_mutex> lck(ackNumMutex);
     ackNum++;
     ackNum = ackNum & 0x07;
 }
@@ -673,7 +581,7 @@ h5_state_t H5Transport::stateActionStart()
     stateMachineChange.notify_all();
     stateMachineLock.lock();
 
-    // Wait for notification of a stateMachineChange that exits the state
+    // Wait for notification of a stateMachineChange that exists the state
     stateMachineChange.wait(stateMachineLock, [&exit] { return exit->isFullfilled(); });
 
     // Order is of importance when returning state
@@ -769,7 +677,7 @@ h5_state_t H5Transport::stateActionUninitialized()
         std::stringstream status;
         status << "No response from device. Tried to send packet "
                << std::to_string(PACKET_RETRANSMISSIONS) << " times.";
-        statusHandler(PKT_SEND_MAX_RETRIES_REACHED, status.str());
+        statusHandler(PKT_SEND_MAX_RETRIES_REACHED, status.str().c_str());
         return STATE_NO_RESPONSE;
     }
 
@@ -815,7 +723,7 @@ h5_state_t H5Transport::stateActionInitialized()
         std::stringstream status;
         status << "No response from device. Tried to send packet "
                << std::to_string(PACKET_RETRANSMISSIONS) << " times.";
-        statusHandler(PKT_SEND_MAX_RETRIES_REACHED, status.str());
+        statusHandler(PKT_SEND_MAX_RETRIES_REACHED, status.str().c_str());
         return STATE_NO_RESPONSE;
     }
 
@@ -826,13 +734,8 @@ h5_state_t H5Transport::stateActionActive()
     std::unique_lock<std::mutex> stateMachineLock(stateMachineMutex);
     auto exit = dynamic_cast<ActiveExitCriterias *>(exitCriterias[STATE_ACTIVE].get());
 
-    {
-        std::unique_lock<std::recursive_mutex> seqNumLck(seqNumMutex);
-        std::unique_lock<std::recursive_mutex> ackNumLck(ackNumMutex);
-
-        seqNum = 0;
-        ackNum = 0;
-    }
+    seqNum = 0;
+    ackNum = 0;
 
     statusHandler(CONNECTION_ACTIVE, "Connection active");
     stateMachineChange.wait(stateMachineLock, [&exit] { return exit->isFullfilled(); }); // T#2
@@ -903,10 +806,10 @@ void H5Transport::setupStateMachine()
 
 void H5Transport::startStateMachine()
 {
+    currentState = STATE_START;
+
     if (!stateMachineThread.joinable())
     {
-        currentState = STATE_START;
-
         // Lock the stateMachineMutex and let stateMachineThread notify
         // when the state machine is ready to process states
         std::unique_lock<std::mutex> stateMachineLock(stateMachineMutex);
@@ -934,87 +837,64 @@ void H5Transport::stopStateMachine()
 }
 
 // State machine thread
-void H5Transport::stateMachineWorker() noexcept
+void H5Transport::stateMachineWorker()
 {
-    try
+    while (currentState != STATE_FAILED && currentState != STATE_CLOSED &&
+           currentState != STATE_NO_RESPONSE)
     {
-        auto doRun = true;
+        const auto nextState = stateActions[currentState]();
 
-        while (doRun)
+        // Make sure that state is not changed when assigning a new current state
         {
-            // Run next state actions
-            const auto nextState = stateActions[currentState]();
+            std::unique_lock<std::mutex> stateMachineLock(stateMachineMutex);
+            logStateTransition(currentState, nextState);
 
-            // After returning from current state action, lock the current state
-            std::unique_lock<std::mutex> currentStateLck(currentStateMutex);
-
-            // Make sure that state is not changed when assigning a new current state
+            // Reset the next states variables before starting to use them.
+            switch (nextState)
             {
-                std::unique_lock<std::mutex> stateMachineLock(stateMachineMutex);
-                logStateTransition(currentState, nextState);
-
-                // Reset the next states variables before starting to use them.
-                switch (nextState)
-                {
-                    case STATE_START:
-                        dynamic_cast<StartExitCriterias *>(exitCriterias[STATE_START].get())
-                            ->reset();
-                        break;
-                    case STATE_RESET:
-                        dynamic_cast<ResetExitCriterias *>(exitCriterias[STATE_RESET].get())
-                            ->reset();
-                        break;
-                    case STATE_UNINITIALIZED:
-                        dynamic_cast<UninitializedExitCriterias *>(
-                            exitCriterias[STATE_UNINITIALIZED].get())
-                            ->reset();
-                        break;
-                    case STATE_INITIALIZED:
-                        dynamic_cast<InitializedExitCriterias *>(
-                            exitCriterias[STATE_INITIALIZED].get())
-                            ->reset();
-                        break;
-                    case STATE_ACTIVE:
-                        dynamic_cast<ActiveExitCriterias *>(exitCriterias[STATE_ACTIVE].get())
-                            ->reset();
-                        break;
-                    case STATE_FAILED:
-                    case STATE_CLOSED:
-                    case STATE_NO_RESPONSE:
-                        // These are terminal states that do not have exit criteria associated with
-                        // them
-                        break;
-                    case STATE_UNKNOWN:
-                        // Not used
-                        break;
-                }
-
-                currentState = nextState;
-
-                // Check if current state give any reason to continue running this thread
-                if (currentState == STATE_FAILED || currentState == STATE_CLOSED ||
-                    currentState == STATE_NO_RESPONSE)
-                {
-                    doRun = false;
-                }
-
-                // Inform interested parties that new current state is set and ready
-                currentStateChange.notify_all();
+                case STATE_START:
+                    dynamic_cast<StartExitCriterias *>(exitCriterias[STATE_START].get())->reset();
+                    break;
+                case STATE_RESET:
+                    dynamic_cast<ResetExitCriterias *>(exitCriterias[STATE_RESET].get())->reset();
+                    break;
+                case STATE_UNINITIALIZED:
+                    dynamic_cast<UninitializedExitCriterias *>(
+                        exitCriterias[STATE_UNINITIALIZED].get())
+                        ->reset();
+                    break;
+                case STATE_INITIALIZED:
+                    dynamic_cast<InitializedExitCriterias *>(exitCriterias[STATE_INITIALIZED].get())
+                        ->reset();
+                    break;
+                case STATE_ACTIVE:
+                    dynamic_cast<ActiveExitCriterias *>(exitCriterias[STATE_ACTIVE].get())->reset();
+                    break;
+                case STATE_FAILED:
+                case STATE_CLOSED:
+                case STATE_NO_RESPONSE:
+                    // These are terminal states that do not have exit criteria associated with
+                    // them
+                    break;
+                case STATE_UNKNOWN:
+                    // Not used
+                    break;
             }
+
+            currentState = nextState;
         }
 
-        stateMachineReady = false;
+        // Inform interested parties that new current state is set and ready
+        stateWaitCondition.notify_all();
     }
-    catch (const std::exception &e)
-    {
-        log(SD_RPC_LOG_FATAL, "Error in state machine thread", e);
-    }
+
+    stateMachineReady = false;
 }
 
 bool H5Transport::waitForState(h5_state_t state, std::chrono::milliseconds timeout)
 {
-    std::unique_lock<std::mutex> lock(currentStateMutex);
-    return currentStateChange.wait_for(lock, timeout,
+    std::unique_lock<std::mutex> lock(stateMutex);
+    return stateWaitCondition.wait_for(lock, timeout,
                                        [&state, this] { return currentState == state; });
 }
 
@@ -1022,14 +902,9 @@ bool H5Transport::waitForState(h5_state_t state, std::chrono::milliseconds timeo
 
 #pragma region Sending packet types
 
-void H5Transport::sendControlPacket(const control_pkt_type type, const uint8_t ackNum)
+void H5Transport::sendControlPacket(const control_pkt_type type)
 {
     h5_pkt_type_t h5_packet;
-
-    if (ackNum == 0xff && type == CONTROL_PKT_ACK)
-    {
-        throw std::invalid_argument("Argument ackNum must be set for CONTROL_PKT_ACK");
-    }
 
     switch (type)
     {
@@ -1054,13 +929,17 @@ void H5Transport::sendControlPacket(const control_pkt_type type, const uint8_t a
     try
     {
         const auto payload = getPktPattern(type);
+
         h5_encode(payload, h5Packet, 0, type == CONTROL_PKT_ACK ? ackNum : 0, false, false,
                   h5_packet);
     }
     catch (const std::out_of_range &e)
     {
         std::stringstream logLine;
-        log(SD_RPC_LOG_FATAL, "Trying to send unknown control packet to device, aborting", e);
+
+        logLine << "Trying to send unknown control packet to device. " << e.what() << ". Aborting.";
+        log(SD_RPC_LOG_INFO, logLine.str());
+
         std::terminate();
     }
 
@@ -1075,7 +954,7 @@ void H5Transport::sendControlPacket(const control_pkt_type type, const uint8_t a
 #pragma endregion Methods related to sending packet types defined in the Three Wire Standard
 
 #pragma region Debugging
-std::string H5Transport::stateToString(const h5_state_t state) noexcept
+std::string H5Transport::stateToString(const h5_state_t state)
 {
     switch (state)
     {
@@ -1098,16 +977,9 @@ std::string H5Transport::stateToString(const h5_state_t state) noexcept
         case STATE_UNKNOWN:
             return "STATE_UNKNOWN";
         default:
-            try
-            {
-                std::stringstream ss;
-                ss << "UNKNOWN[0x" << std::hex << static_cast<uint32_t>(state) << "]";
-                return ss.str();
-            }
-            catch (const std::exception &)
-            {
-                return "ERROR creating string describing state";
-            }
+            std::stringstream ss;
+            ss << "UNKNOWN[0x" << std::hex << static_cast<uint32_t>(state) << "]";
+            return ss.str();
     }
 }
 
@@ -1216,16 +1088,16 @@ std::string H5Transport::h5PktToString(const bool out, const payload_t &h5Packet
     payload_t payload;
 
     uint8_t seq_num;
-    uint8_t decodedAckNum;
-    bool decodedReliablePacket;
-    h5_pkt_type_t decodedPacketType;
+    uint8_t ack_num;
+    bool reliable_packet;
+    h5_pkt_type_t packet_type;
     bool data_integrity;
     uint16_t payload_length;
     uint8_t header_checksum;
 
     const auto err_code =
-        h5_decode(h5Packet, payload, &seq_num, &decodedAckNum, &data_integrity, &payload_length,
-                  &header_checksum, &decodedReliablePacket, &decodedPacketType);
+        h5_decode(h5Packet, payload, &seq_num, &ack_num, &data_integrity, &payload_length,
+                  &header_checksum, &reliable_packet, &packet_type);
 
     std::stringstream count;
 
@@ -1241,9 +1113,9 @@ std::string H5Transport::h5PktToString(const bool out, const payload_t &h5Packet
 
     std::stringstream retval;
     retval << count.str() << " [" << asHex(payload) << "] "
-           << "type:" << std::setw(20) << pktTypeToString(decodedPacketType)
-           << " reliable:" << std::setw(3) << (decodedReliablePacket ? "yes" : "no")
-           << " seq#:" << std::hex << +seq_num << " ack#:" << std::hex << +decodedAckNum
+           << "type:" << std::setw(20) << pktTypeToString(packet_type)
+           << " reliable:" << std::setw(3) << (reliable_packet ? "yes" : "no")
+           << " seq#:" << std::hex << +seq_num << " ack#:" << std::hex << +ack_num
            << " payload_length:" << +payload_length << " data_integrity:" << data_integrity;
 
     if (data_integrity)
@@ -1253,7 +1125,7 @@ std::string H5Transport::h5PktToString(const bool out, const payload_t &h5Packet
 
     retval << " err_code:0x" << std::hex << err_code;
 
-    if (decodedPacketType == LINK_CONTROL_PACKET)
+    if (packet_type == LINK_CONTROL_PACKET)
     {
         retval << " " << hciPacketLinkControlToString(payload);
     }
@@ -1265,11 +1137,11 @@ void H5Transport::logPacket(const bool outgoing, const payload_t &packet)
 {
     if (outgoing)
     {
-        ++outgoingPacketCount;
+        outgoingPacketCount++;
     }
     else
     {
-        ++incomingPacketCount;
+        incomingPacketCount++;
     }
 
     const std::string logLine = h5PktToString(outgoing, packet);

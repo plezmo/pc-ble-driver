@@ -7,6 +7,9 @@
 #include "test_util_conversion.h"
 #include "test_util_role.h"
 
+// Logging support
+#include "internal/log.h"
+
 #include "ble.h"
 #include "sd_rpc.h"
 

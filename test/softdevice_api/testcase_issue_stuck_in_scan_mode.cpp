@@ -39,9 +39,9 @@
 #include "catch2/catch.hpp"
 
 // Logging support
-#include <logging.h>
+#include <internal/log.h>
 
-#include <test_environment.h>
+#include <test_setup.h>
 #include <test_util.h>
 
 #include <ble.h>
@@ -50,8 +50,8 @@
 #include <sstream>
 #include <thread>
 
-TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
-    issue_stuck_in_scan_mode, [issue][PCA10028][PCA10031][PCA10040][PCA10056][PCA10059]))
+TEST_CASE(CREATE_TEST_NAME_AND_TAGS(issue_stuck_in_scan_mode,
+                                    [issue][PCA10028][PCA10031][PCA10040][PCA10056][PCA10059]))
 {
     // Indicates if an error has occurred in a callback.
     // The test framework is not thread safe so this variable is used to communicate that an issues
@@ -90,18 +90,8 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
 
     // Instantiated an adapter to use as BLE Peripheral in the test
     auto p = std::make_shared<testutil::AdapterWrapper>(
-        testutil::Role::Peripheral, peripheral.port, env.baudRate, env.mtu,
-        env.retransmissionInterval, env.responseTimeout);
-
-    p->setStatusCallback([&](const sd_rpc_app_status_t code, const std::string &message) {
-        if (code == PKT_DECODE_ERROR || code == PKT_SEND_MAX_RETRIES_REACHED ||
-            code == PKT_UNEXPECTED)
-        {
-            error = true;
-            get_logger()->error("{} error in status callback {:x}:{}", p->role(),
-                                static_cast<uint32_t>(code), message);
-        }
-    });
+        testutil::Peripheral, peripheral.port, env.baudRate, env.mtu, env.retransmissionInterval,
+        env.responseTimeout);
 
     REQUIRE(sd_rpc_log_handler_severity_filter_set(p->unwrap(), env.driverLogLevel) == NRF_SUCCESS);
     REQUIRE(p->open() == NRF_SUCCESS);
@@ -120,21 +110,11 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
         auto adv_report_count = 0;
 
         auto c = std::make_shared<testutil::AdapterWrapper>(
-            testutil::Role::Central, central.port, env.baudRate, env.mtu,
-            env.retransmissionInterval, env.responseTimeout);
+            testutil::Central, central.port, env.baudRate, env.mtu, env.retransmissionInterval,
+            env.responseTimeout);
 
-        c->setStatusCallback([&](const sd_rpc_app_status_t code, const std::string &message) {
-            if (code == PKT_DECODE_ERROR || code == PKT_SEND_MAX_RETRIES_REACHED ||
-                code == PKT_UNEXPECTED)
-            {
-                error = true;
-                get_logger()->error("{}  error in status callback {:x}:{}", c->role(),
-                                    static_cast<uint32_t>(code), message);
-            }
-        });
-
-        get_logger()->info("{} Starting scan iteration #{} of {}", c->role(),
-                           static_cast<uint32_t>(i), static_cast<uint32_t>(scanIterations));
+        NRF_LOG(c->role() << " Starting scan iteration #" << std::dec << static_cast<uint32_t>(i)
+                          << " of " << static_cast<uint32_t>(scanIterations));
 
         REQUIRE(sd_rpc_log_handler_severity_filter_set(c->unwrap(), env.driverLogLevel) ==
                 NRF_SUCCESS);
@@ -147,15 +127,15 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
             {
                 case BLE_GAP_EVT_ADV_REPORT:
                     adv_report_count++;
-                    get_logger()->debug("adv_report_count: {}", adv_report_count);
+                    NRF_LOG("adv_report_count: " << adv_report_count);
 #if NRF_SD_BLE_API == 6
                     {
                         const auto err_code = c->startScan(true);
                         if (err_code != NRF_SUCCESS)
                         {
-                            get_logger()->error(
-                                "{} startScan in BLE_GAP_EVT_ADV_REPORT failed, err_code {}",
-                                c->role(), err_code);
+                            NRF_LOG(c->role()
+                                    << " startScan in BLE_GAP_EVT_ADV_REPORT failed, err_code "
+                                    << err_code);
                             error = true;
                         }
                     }
@@ -170,8 +150,7 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
 
                         if (err_code != NRF_SUCCESS)
                         {
-                            get_logger()->error("{}  Scan start error, err_code {:x}", c->role(),
-                                                err_code);
+                            NRF_LOG(c->role() << " Scan start error, err_code " << err_code);
                             error = true;
                         }
                     }
@@ -181,8 +160,6 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
             }
         });
 
-        REQUIRE(sd_rpc_log_handler_severity_filter_set(c->unwrap(), env.driverLogLevel) ==
-                NRF_SUCCESS);
         REQUIRE(c->open() == NRF_SUCCESS);
         REQUIRE(c->configure() == NRF_SUCCESS);
         REQUIRE(c->startScan() == NRF_SUCCESS);
@@ -202,9 +179,7 @@ TEST_CASE(CREATE_TEST_NAME_AND_TAGS(
         CHECK(c->close() == NRF_SUCCESS);
         sd_rpc_adapter_delete(c->unwrap());
 
-        get_logger()->info("{}  Scan iteration #{} of {} completed", c->role(),
-                           static_cast<uint32_t>(i), static_cast<uint32_t>(scanIterations));
-        if (error == true)
-            return;
+        NRF_LOG(c->role() << " Scan iteration #" << std::dec << static_cast<uint32_t>(i) << " of "
+                          << static_cast<uint32_t>(scanIterations) << " completed");
     }
 }

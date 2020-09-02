@@ -43,27 +43,25 @@
 #define NRF_LOG_SETUP
 #include <internal/log.h>
 
-#include <nrf_error.h>
 #include <sd_rpc.h>
+#include <nrf_error.h>
 
-#include <test_environment.h>
+#include <test_setup.h>
 
 #if defined(_MSC_VER)
 // Disable warning "This function or variable may be unsafe. Consider using _dupenv_s instead."
-#pragma warning(disable : 4996)
+#pragma warning(disable: 4996)
 #endif
 
 TEST_CASE("SerialPortEnumeration")
 {
-    SECTION("Array not large enough for devices found")
-    {
+    SECTION("Array not large enough for devices found") {
         std::vector<sd_rpc_serial_port_desc_t> devices(0);
         auto size = static_cast<uint32_t>(devices.capacity());
         REQUIRE(sd_rpc_serial_port_enum(devices.data(), &size) == NRF_ERROR_DATA_SIZE);
     }
 
-    SECTION("Array large enough for devices found")
-    {
+    SECTION("Array large enough for devices found") {
         std::vector<sd_rpc_serial_port_desc_t> devices(100);
         auto size = static_cast<uint32_t>(devices.capacity());
         REQUIRE(sd_rpc_serial_port_enum(devices.data(), &size) == NRF_SUCCESS);

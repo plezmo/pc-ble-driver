@@ -336,7 +336,9 @@ uint32_t sd_ble_gap_privacy_get(adapter_t *adapter, ble_gap_privacy_params_t *p_
     return gap_encode_decode(adapter, encode_function, decode_function);
 }
 
-uint32_t sd_ble_gap_adv_stop(adapter_t *adapter, uint8_t adv_handle)
+uint32_t sd_ble_gap_adv_stop(adapter_t *adapter, uint8_t adv_handle
+
+)
 {
     encode_function_t encode_function = [&](uint8_t *buffer, uint32_t *length) -> uint32_t {
         return ble_gap_adv_stop_req_enc(adv_handle, buffer, length);
@@ -442,7 +444,12 @@ uint32_t sd_ble_gap_tx_power_set(adapter_t *adapter, uint8_t role, uint16_t hand
 uint32_t sd_ble_gap_scan_stop(adapter_t *adapter)
 {
     encode_function_t encode_function = [&](uint8_t *buffer, uint32_t *length) -> uint32_t {
-        return ble_gap_scan_stop_req_enc(buffer, length);
+        const auto err_code = ble_gap_scan_stop_req_enc(buffer, length);
+
+#if defined(NRF_SD_BLE_API_VERSION) && NRF_SD_BLE_API_VERSION > 5
+        app_ble_gap_scan_data_unset(true);
+#endif
+        return err_code;
     };
 
     decode_function_t decode_function = [&](uint8_t *buffer, uint32_t length,
@@ -450,16 +457,7 @@ uint32_t sd_ble_gap_scan_stop(adapter_t *adapter)
         return ble_gap_scan_stop_rsp_dec(buffer, length, result);
     };
 
-    const auto err_code = gap_encode_decode(adapter, encode_function, decode_function);
-
-#if defined(NRF_SD_BLE_API_VERSION) && NRF_SD_BLE_API_VERSION > 5
-    if (err_code == NRF_SUCCESS)
-    {
-        app_ble_gap_scan_data_unset(true);
-    }
-#endif
-
-    return err_code;
+    return gap_encode_decode(adapter, encode_function, decode_function);
 }
 
 uint32_t sd_ble_gap_connect(adapter_t *adapter, ble_gap_addr_t const *const p_addr,

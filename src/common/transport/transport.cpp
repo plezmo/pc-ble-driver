@@ -39,17 +39,16 @@
 
 #include "nrf_error.h"
 
-#include <cstdint>
 #include <iostream>
-#include <sstream>
+#include <stdint.h>
 
 using namespace std;
 
-Transport::Transport()           = default;
-Transport::~Transport() noexcept = default;
+Transport::Transport()  = default;
+Transport::~Transport() = default;
 
 uint32_t Transport::open(const status_cb_t &status_callback, const data_cb_t &data_callback,
-                         const log_cb_t &log_callback) noexcept
+                         const log_cb_t &log_callback)
 {
     if (!status_callback || !data_callback || !log_callback)
     {
@@ -63,25 +62,11 @@ uint32_t Transport::open(const status_cb_t &status_callback, const data_cb_t &da
     return NRF_SUCCESS;
 }
 
-void Transport::log(const sd_rpc_log_severity_t severity, const std::string &message) const noexcept
+void Transport::log(const sd_rpc_log_severity_t severity, const std::string &message) const
 {
     if (upperLogCallback)
     {
-        try
-        {
-            upperLogCallback(severity, message);
-        }
-        catch (const std::exception &ex)
-        {
-            try
-            {
-                std::cerr << "Exception thrown in log callback, " << ex.what() << '\n';
-            }
-            catch (const std::exception &)
-            {
-                std::cerr << "Fatal error creating log callback string\n";
-            }
-        }
+        upperLogCallback(severity, message);
     }
     else
     {
@@ -89,58 +74,14 @@ void Transport::log(const sd_rpc_log_severity_t severity, const std::string &mes
     }
 }
 
-void Transport::log(const sd_rpc_log_severity_t severity, const std::string &message,
-                    const std::exception &ex) const noexcept
-{
-    try
-    {
-        std::stringstream message_with_exception;
-        message_with_exception << message << ", " << ex.what();
-        log(severity, message_with_exception.str());
-    }
-    catch (const std::exception &)
-    {
-        std::cerr << "Fatal error creating log callback string" << std::endl;
-    }
-}
-
-void Transport::status(const sd_rpc_app_status_t code, const std::string &message) const noexcept
+void Transport::status(const sd_rpc_app_status_t code, const std::string &message) const
 {
     if (upperLogCallback)
     {
-        try
-        {
-            upperStatusCallback(code, message);
-        }
-        catch (const std::exception &ex)
-        {
-            try
-            {
-                std::cerr << "Exception thrown in status callback, " << ex.what() << '\n';
-            }
-            catch (const std::exception &)
-            {
-                std::cerr << "Fatal error creating status callback string" << std::endl;
-            }
-        }
+        upperStatusCallback(code, message);
     }
     else
     {
         std::cerr << "status(" << static_cast<uint32_t>(code) << ") " << message << std::endl;
-    }
-}
-
-void Transport::status(const sd_rpc_app_status_t code, const std::string &message,
-                       const std::exception &ex) const noexcept
-{
-    try
-    {
-        std::stringstream status_with_exception;
-        status_with_exception << message << ", " << ex.what();
-        status(code, status_with_exception.str());
-    }
-    catch (const std::exception &)
-    {
-        std::cerr << "Fatal error creating status callback string" << std::endl;
     }
 }
